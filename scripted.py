@@ -50,13 +50,17 @@ REQUIRED_COLUMNS: List[str] = [
     "Employee Name",
     "Employee Status",
     "Worker Type",
+    "Employee Group",
     "Management Level",
     "First Hire Date",
     "Last Hire Date",
     "Position Name",
+    "Job Family Group",
     "Job Family",
+    "Job Profile Description",
     "ABI Entity 2",
     "Macro Entity Level 2 (Zone)",
+    "text before Email",
     "Employee Email",
     "Band 4+",
     "Manager Employee ID Level 01",
@@ -203,6 +207,7 @@ def process_excel_inplace(input_path: str) -> None:
 
 
 def run_clean(master_path: str, chunksize: int, parallel_arg: str) -> None:
+    warn_missing_keep_columns(master_path)
     ext = os.path.splitext(master_path)[1].lower()
     if ext == ".csv":
         workers = safe_workers(parallel_arg)
@@ -237,6 +242,21 @@ def read_header_columns(path: str) -> List[str]:
     else:
         raise ValueError(f"Unsupported file type: {ext}")
     return list(df.columns)
+
+
+def warn_missing_keep_columns(path: str) -> None:
+    """Warn if any expected keep-list column is absent from the file, so a
+    typo'd / renamed header doesn't silently vanish from the cleaned output."""
+    try:
+        cols = set(read_header_columns(path))
+    except Exception:
+        return
+    missing = [c for c in REQUIRED_COLUMNS if c not in cols]
+    if missing:
+        print("WARNING: these expected columns were NOT found in the master "
+              "and will be absent from the cleaned output:")
+        for c in missing:
+            print(f"   - {c}")
 
 
 def load_table(path: str) -> pd.DataFrame:
