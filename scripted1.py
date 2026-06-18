@@ -18,18 +18,28 @@ Step 1 (adaptive clean) — runs ONLY when the master needs it:
     never wipes the 'status' column or earlier zones' results.
 
 Step 2 (reconcile one zone) — runs every time:
-    Reads which zone the dropped file is for (from its 'Zone' column). Zone-file
-    rows are first filtered: rows with blank/'@'-less/'noemail@' emails are
-    dropped, and — if the zone file has an 'Action' column — rows whose Action
-    is anything other than 'ok' (case-insensitive) are dropped too. It then
-    compares the master against the remaining zone rows on (Global Employee ID
-    AND Employee Email):
-      * master row of that zone found in the zone file -> status "validated"
-      * master row of that zone NOT in the zone file   -> status "not validated"
-      * zone-file person not anywhere in the master    -> appended to the master
-                                                          with status "newly added"
-    Rows of other zones are left untouched. The master is updated in place,
-    with a timestamped backup taken before each change.
+    Reads which zone the dropped file is for (from its 'Zone' column) and drops
+    zone rows with blank/'@'-less/'noemail@' emails. Each remaining zone row is
+    matched to the master with a CASCADE key — tried in priority order, stopping
+    at the first that hits:
+        Employee Email  ->  Global Employee ID  ->  Local Employee ID
+    Matching is global (a zone person is found even if they live in a different
+    zone in the master). The zone row's 'Action' column then drives the outcome:
+      * Action == "ok" (case-insensitive):
+          - matched   -> that master row's status becomes "validated"
+                         (anywhere in the master, regardless of its Zone)
+          - unmatched -> the person is appended to the master as "newly added"
+      * Action is a non-blank value other than "ok":
+          - matched   -> that master row is DELETED from the master
+          - unmatched -> no-op
+      * Action blank (or no Action column on a single row): no-op. If the zone
+        file has NO Action column at all, every row is treated as "ok".
+    Master rows of the reconciled zone that no "ok" row matched (and that were
+    not deleted) become "not validated". Rows of other zones are left untouched
+    unless a cross-zone match validated or deleted them.
+    Finally, duplicate emails are removed from the master (keep first). The
+    master is updated in place, with a timestamped backup taken before each
+    change.
 """
 
 import argparse
@@ -38,7 +48,7 @@ import sys
 import shutil
 import tempfile
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional
 
 import pandas as pd
 
@@ -73,8 +83,9 @@ REQUIRED_COLUMNS: List[str] = [
 # Column / status constants
 KEY_ID = "Global Employee ID"
 KEY_EMAIL = "Employee Email"
+LOCAL_ID = "Local Employee ID"
 ZONE_COL = "Zone"
-ACTION_COL = "Action"          # zone-file column; rows kept only when its value is "ok"
+ACTION_COL = "Action"          # zone-file column; "ok" => validate/add, other => delete
 ACTION_OK = "ok"
 STATUS_COLUMN = "status"
 STATUS_VALIDATED = "validated"
@@ -335,32 +346,52 @@ def _norm_id(v) -> str:
     return s
 
 
-def normalize_key(emp_id, email) -> Tuple[str, str]:
-    """Match key: (normalized Global Employee ID, lower-cased Employee Email)."""
-    sid = _norm_id(emp_id)
-    if email is None:
-        semail = ""
-    else:
-        try:
-            semail = "" if pd.isna(email) else str(email).strip().lower()
-        except (TypeError, ValueError):
-            semail = str(email).strip().lower()
-    return (sid, semail)
+def _norm_email(v) -> str:
+    """Normalize an email for matching / dedupe: trimmed + lower-cased; '' if NA."""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip().lower()
 
 
-def make_keys(df: pd.DataFrame) -> pd.Series:
-    if len(df) == 0:
-        return pd.Series([], dtype=object, index=df.index)
-    return df.apply(lambda r: normalize_key(r[KEY_ID], r[KEY_EMAIL]), axis=1)
+def _norm_local(v) -> str:
+    """Normalize a Local Employee ID for matching: trimmed + lower-cased.
+
+    Local ids are strings like 'EUR-600101', so (unlike Global IDs) they are not
+    run through the float-stripping logic."""
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v).strip().lower()
 
 
-def dedupe_by_key(df: pd.DataFrame, key_series: pd.Series, label: str):
-    dup_mask = key_series.duplicated(keep="first")
-    n = int(dup_mask.sum())
-    if n:
-        print(f"WARNING: {label}: {n} duplicate (Global Employee ID, Employee Email) "
-              f"row(s) found; keeping first.")
-    return df[~dup_mask].reset_index(drop=True), key_series[~dup_mask].reset_index(drop=True)
+def build_index_map(norm_series: Optional[pd.Series]) -> dict:
+    """Map each non-empty normalized value -> list of master index labels."""
+    out: dict = {}
+    if norm_series is None:
+        return out
+    for idx, key in norm_series.items():
+        if key:
+            out.setdefault(key, []).append(idx)
+    return out
+
+
+def cascade_match(z_email: str, z_gid: str, z_lid: str,
+                  emap: dict, gmap: dict, lmap: dict) -> list:
+    """Find matching master index labels for one zone row, trying keys in
+    priority order and STOPPING at the first tier that yields any hit:
+    Employee Email -> Global Employee ID -> Local Employee ID."""
+    if z_email and z_email in emap:
+        return emap[z_email]
+    if z_gid and z_gid in gmap:
+        return gmap[z_gid]
+    if z_lid and z_lid in lmap:
+        return lmap[z_lid]
+    return []
 
 
 # =========================================================
@@ -423,7 +454,9 @@ def reconcile_zone_inplace(master_path: str, zone_path: str, zone_override: Opti
     # 1) Back up the master before any change.
     backup_path = backup_file(master_path)
 
-    # 2) Load master, ensure required columns + status column.
+    # 2) Load master, ensure required columns + status column. The native
+    #    RangeIndex is kept stable: every match below works on these labels,
+    #    and the index is only reset at the very end.
     master = load_table(master_path)
     for col in (KEY_ID, KEY_EMAIL, ZONE_COL):
         if col not in master.columns:
@@ -433,7 +466,7 @@ def reconcile_zone_inplace(master_path: str, zone_path: str, zone_override: Opti
     else:
         master[STATUS_COLUMN] = master[STATUS_COLUMN].fillna("")
 
-    # 3) Load zone file; require id + email; drop invalid emails.
+    # 3) Load zone file; require id + email; drop invalid/placeholder emails.
     zone = load_table(zone_path)
     for col in (KEY_ID, KEY_EMAIL):
         if col not in zone.columns:
@@ -443,60 +476,100 @@ def reconcile_zone_inplace(master_path: str, zone_path: str, zone_override: Opti
     dropped_invalid = int((~zmask).sum())
     zone = zone[zmask].reset_index(drop=True)
 
-    # 3b) Drop rows whose 'Action' is anything other than 'ok' (if the column
-    #     exists; otherwise keep all rows).
-    amask = action_ok_mask(zone)
-    if amask is None:
-        dropped_action = 0
-    else:
-        dropped_action = int((~amask).sum())
-        zone = zone[amask].reset_index(drop=True)
-
-    # 4) Resolve which zone this file is for.
+    # 4) Resolve which zone this file is for (uses the Zone column, independent
+    #    of Action -> resolve from the full email-valid frame).
     resolved_zone = resolve_zone(zone, zone_override)
 
-    # 5) Keys on both sides; dedupe zone file by key.
-    zone_key_all = make_keys(zone)
-    zone, zone_key = dedupe_by_key(zone, zone_key_all, "Zone file")
-    master_key = make_keys(master)
+    # 5) Split zone rows by Action:
+    #      "ok" (case-insensitive)                -> validate if matched, else add
+    #      a non-blank value other than "ok"      -> delete the matched master row
+    #      blank Action / no Action column        -> 'ok' if no column, else no-op
+    ok_mask = action_ok_mask(zone)
+    if ok_mask is None:
+        ok_rows = zone
+        nonok_rows = zone.iloc[0:0]
+        blank_action = 0
+    else:
+        action_col = find_action_column(zone)
+        action_vals = zone[action_col].fillna("").astype(str).str.strip()
+        is_blank = action_vals.eq("")
+        ok_rows = zone[ok_mask]
+        nonok_rows = zone[(~ok_mask) & (~is_blank)]
+        blank_action = int(((~ok_mask) & is_blank).sum())
 
-    zone_key_set = set(zone_key)
-    master_key_set = set(master_key)
+    # 6) Build cascade lookups from the ORIGINAL master (value -> index labels).
+    emap = build_index_map(master[KEY_EMAIL].map(_norm_email))
+    gmap = build_index_map(master[KEY_ID].map(_norm_id))
+    lmap = build_index_map(master[LOCAL_ID].map(_norm_local)) if LOCAL_ID in master.columns else {}
+    has_zone_lid = LOCAL_ID in zone.columns
 
-    # 6) Scope master to the current zone; set validated / not validated.
+    def zkeys(row):
+        e = _norm_email(row[KEY_EMAIL])
+        g = _norm_id(row[KEY_ID])
+        l = _norm_local(row[LOCAL_ID]) if has_zone_lid else ""
+        return e, g, l
+
+    # 7) Cascade-match. ok rows -> validate (if hit) else newly-added;
+    #    non-ok rows -> delete the matched master row(s).
+    validated_idx = set()
+    newly_added_pos = []
+    for pos, (_, row) in enumerate(ok_rows.iterrows()):
+        e, g, l = zkeys(row)
+        hits = cascade_match(e, g, l, emap, gmap, lmap)
+        if hits:
+            validated_idx.update(hits)
+        else:
+            newly_added_pos.append(pos)
+
+    delete_idx = set()
+    for _, row in nonok_rows.iterrows():
+        e, g, l = zkeys(row)
+        delete_idx.update(cascade_match(e, g, l, emap, gmap, lmap))
+
+    # Deletion wins over validation if a master row is targeted by both.
+    validated_idx -= delete_idx
+
+    # 8) Apply statuses on the original index labels (before any drop/append).
+    if validated_idx:
+        master.loc[list(validated_idx), STATUS_COLUMN] = STATUS_VALIDATED
+
     zone_norm = str(resolved_zone).strip().lower()
-    master_zone_mask = (
-        master[ZONE_COL].fillna("").astype(str).str.strip().str.lower() == zone_norm
-    )
-    in_zone_file = master_key.isin(zone_key_set)
+    in_zone = master[ZONE_COL].fillna("").astype(str).str.strip().str.lower() == zone_norm
+    nv_idx = (set(master.index[in_zone]) - validated_idx) - delete_idx
+    if nv_idx:
+        master.loc[list(nv_idx), STATUS_COLUMN] = STATUS_NOT_VALIDATED
 
-    validated_mask = master_zone_mask & in_zone_file
-    not_validated_mask = master_zone_mask & ~in_zone_file
+    # 9) Delete the non-ok matched rows from the master.
+    if delete_idx:
+        master = master.drop(index=list(delete_idx))
 
-    master.loc[validated_mask, STATUS_COLUMN] = STATUS_VALIDATED
-    master.loc[not_validated_mask, STATUS_COLUMN] = STATUS_NOT_VALIDATED
-
-    # 7) Newly added: zone people not present anywhere in the master.
-    new_rows_mask = ~zone_key.isin(master_key_set)
-    new_rows = zone[new_rows_mask].reset_index(drop=True)
+    # 10) Append newly-added rows (ok rows that matched nothing) as-is.
+    new_rows = ok_rows.iloc[newly_added_pos] if newly_added_pos else ok_rows.iloc[0:0]
     appended = build_appended_rows(new_rows, master.columns, resolved_zone)
-    if not appended.empty:
-        master = pd.concat([master, appended], ignore_index=True)
+    master = pd.concat([master, appended], ignore_index=True)
 
-    # 8) Write back in place + summary.
+    # 11) FINAL step: remove duplicate emails from the master (keep first;
+    #     blank emails are exempt so they don't all collapse into one row).
+    email_norm = master[KEY_EMAIL].fillna("").astype(str).str.strip().str.lower()
+    dup_mask = email_norm.duplicated(keep="first") & email_norm.ne("")
+    dedupe_removed = int(dup_mask.sum())
+    if dedupe_removed:
+        master = master[~dup_mask].reset_index(drop=True)
+
+    # 12) Write back in place + summary.
     write_table_inplace(master, master_path)
 
-    n_validated = int(validated_mask.sum())
-    n_not_validated = int(not_validated_mask.sum())
-    n_added = int(len(appended))
     print(f"OK: reconciled zone '{resolved_zone}'. Backup saved as: {backup_path}")
-    print(f"   validated      : {n_validated}")
-    print(f"   not validated  : {n_not_validated}")
-    print(f"   newly added    : {n_added}")
+    print(f"   validated       : {len(validated_idx)}")
+    print(f"   not validated   : {len(nv_idx)}")
+    print(f"   newly added     : {int(len(appended))}")
+    print(f"   deleted (master): {len(delete_idx)}")
+    if dedupe_removed:
+        print(f"   duplicate emails removed: {dedupe_removed}")
     if dropped_invalid:
         print(f"   (zone rows skipped for invalid/placeholder email: {dropped_invalid})")
-    if dropped_action:
-        print(f"   (zone rows skipped for Action != 'ok': {dropped_action})")
+    if blank_action:
+        print(f"   (zone rows with blank Action skipped as no-op: {blank_action})")
 
 
 # =========================================================
